@@ -9,12 +9,14 @@
 ## Install
 
 ```bash
-go get github.com/xpfo-go/logs@latest
+go get github.com/xpfo-go/logs/v2@latest
 ```
 
 ## Quick Start
 
 ```go
+import "github.com/xpfo-go/logs/v2"
+
 cfg := logs.LogConfig{
     Dir:        "./logs",
     FileName:   "app",
@@ -45,8 +47,11 @@ type LogConfig struct {
     MaxAge     int    // 保留天数
     MaxSize    int    // 单个文件最大 MB
     MaxBackups int    // 备份文件数
-    LocalTime  bool   // true: 本地时区
-    Console    bool   // true: 同时输出控制台
+    LocalTime  bool   // Deprecated，建议使用 UseLocalTime
+    Console    bool   // Deprecated，建议使用 EnableConsole
+
+    UseLocalTime  *bool // nil:默认(true), false:UTC
+    EnableConsole *bool // nil:默认(true), false:关闭控制台
 }
 ```
 
@@ -73,10 +78,12 @@ defer logs.PrintPanicStack("extra context")
 ## Migration to v2
 
 v2 主要变化：
+- 模块路径改为 `github.com/xpfo-go/logs/v2`
 - 配置初始化改为显式校验并返回错误（非法 level 会报错）
 - 修复 `LocalTime` 配置不生效问题
 - 删除导入时自动初始化副作用，改为惰性默认初始化（首次写日志）或显式 `Init`
 - `PrintPanicStack` 记录后会重新抛出 panic（不再吞 panic）
+- 文件日志输出改为 JSON 编码（更适合日志采集系统）
 
 ## Development
 

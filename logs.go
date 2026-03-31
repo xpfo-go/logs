@@ -22,8 +22,11 @@ type LogConfig struct {
 	MaxAge     int    // 保存天数
 	MaxSize    int    // 单个日志文件最大 MB
 	MaxBackups int    // 备份数量
-	LocalTime  bool   // true:本地时间 false:UTC
-	Console    bool   // 是否输出到控制台
+	LocalTime  bool   // Deprecated: 仅兼容 v1/v2.0.0，建议使用 UseLocalTime
+	Console    bool   // Deprecated: 仅兼容 v1/v2.0.0，建议使用 EnableConsole
+
+	UseLocalTime  *bool // nil:使用默认值(true), false:UTC, true:本地时间
+	EnableConsole *bool // nil:使用默认值(true), false:关闭控制台, true:开启控制台
 }
 
 var (
@@ -74,8 +77,18 @@ func (c LogConfig) withDefaults() LogConfig {
 	if c.MaxBackups > 0 {
 		d.MaxBackups = c.MaxBackups
 	}
-	d.LocalTime = c.LocalTime
-	d.Console = c.Console
+	if c.UseLocalTime != nil {
+		d.LocalTime = *c.UseLocalTime
+	} else if c.LocalTime {
+		// 兼容旧代码显式设置 LocalTime=true 的场景。
+		d.LocalTime = true
+	}
+	if c.EnableConsole != nil {
+		d.Console = *c.EnableConsole
+	} else if c.Console {
+		// 兼容旧代码显式设置 Console=true 的场景。
+		d.Console = true
+	}
 
 	return d
 }
@@ -154,7 +167,7 @@ func Init(cfg LogConfig) error {
 		return lvl >= logLevel && lvl < zapcore.ErrorLevel
 	})
 
-	fileEncoder := zapcore.NewConsoleEncoder(fileEncoderConfig)
+	fileEncoder := zapcore.NewJSONEncoder(fileEncoderConfig)
 	consoleEncoder := zapcore.NewConsoleEncoder(consoleColoredEncoderConfig)
 
 	cores := []zapcore.Core{

@@ -11,12 +11,12 @@ import (
 
 func TestInit_InvalidLevel(t *testing.T) {
 	err := Init(LogConfig{
-		Dir:       t.TempDir(),
-		FileName:  "app",
-		Level:     "invalid",
-		MaxAge:    1,
-		LocalTime: true,
-		Console:   false,
+		Dir:           t.TempDir(),
+		FileName:      "app",
+		Level:         "invalid",
+		MaxAge:        1,
+		UseLocalTime:  boolPtr(true),
+		EnableConsole: boolPtr(false),
 	})
 	if err == nil {
 		t.Fatalf("expected init error for invalid level")
@@ -29,12 +29,12 @@ func TestInit_InvalidLevel(t *testing.T) {
 func TestInit_RoutesLogsByLevel(t *testing.T) {
 	dir := t.TempDir()
 	if err := Init(LogConfig{
-		Dir:       dir,
-		FileName:  "app",
-		Level:     "info",
-		MaxAge:    1,
-		LocalTime: true,
-		Console:   false,
+		Dir:           dir,
+		FileName:      "app",
+		Level:         "info",
+		MaxAge:        1,
+		UseLocalTime:  boolPtr(true),
+		EnableConsole: boolPtr(false),
 	}); err != nil {
 		t.Fatalf("init failed: %v", err)
 	}
@@ -59,6 +59,9 @@ func TestInit_RoutesLogsByLevel(t *testing.T) {
 	if !strings.Contains(logData, "info-message") {
 		t.Fatalf("info logs should appear in main log file")
 	}
+	if !strings.Contains(logData, "\"level\":\"INFO\"") {
+		t.Fatalf("main log should use JSON format, got: %s", logData)
+	}
 	if !strings.Contains(logData, "error-message") {
 		t.Fatalf("error logs should appear in main log file")
 	}
@@ -73,12 +76,12 @@ func TestInit_RoutesLogsByLevel(t *testing.T) {
 func TestGetLogConf_ReturnsCopy(t *testing.T) {
 	dir := t.TempDir()
 	if err := Init(LogConfig{
-		Dir:       dir,
-		FileName:  "app",
-		Level:     "warn",
-		MaxAge:    7,
-		LocalTime: true,
-		Console:   false,
+		Dir:           dir,
+		FileName:      "app",
+		Level:         "warn",
+		MaxAge:        7,
+		UseLocalTime:  boolPtr(true),
+		EnableConsole: boolPtr(false),
 	}); err != nil {
 		t.Fatalf("init failed: %v", err)
 	}
@@ -98,12 +101,12 @@ func TestGetLogConf_ReturnsCopy(t *testing.T) {
 func TestPrintPanicStack_Repanic(t *testing.T) {
 	dir := t.TempDir()
 	if err := Init(LogConfig{
-		Dir:       dir,
-		FileName:  "panic",
-		Level:     "debug",
-		MaxAge:    1,
-		LocalTime: true,
-		Console:   false,
+		Dir:           dir,
+		FileName:      "panic",
+		Level:         "debug",
+		MaxAge:        1,
+		UseLocalTime:  boolPtr(true),
+		EnableConsole: boolPtr(false),
 	}); err != nil {
 		t.Fatalf("init failed: %v", err)
 	}
@@ -127,6 +130,54 @@ func TestPrintPanicStack_Repanic(t *testing.T) {
 	}()
 }
 
+func TestInit_DefaultBoolFallbacks(t *testing.T) {
+	dir := t.TempDir()
+	if err := Init(LogConfig{
+		Dir:      dir,
+		FileName: "app",
+		Level:    "info",
+		MaxAge:   1,
+	}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = Close()
+	})
+
+	cfg := CurrentConfig()
+	if !cfg.LocalTime {
+		t.Fatalf("expected default LocalTime=true")
+	}
+	if !cfg.Console {
+		t.Fatalf("expected default Console=true")
+	}
+}
+
+func TestInit_ExplicitBoolOverrides(t *testing.T) {
+	dir := t.TempDir()
+	if err := Init(LogConfig{
+		Dir:           dir,
+		FileName:      "app",
+		Level:         "info",
+		MaxAge:        1,
+		UseLocalTime:  boolPtr(false),
+		EnableConsole: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = Close()
+	})
+
+	cfg := CurrentConfig()
+	if cfg.LocalTime {
+		t.Fatalf("expected LocalTime=false")
+	}
+	if cfg.Console {
+		t.Fatalf("expected Console=false")
+	}
+}
+
 func waitAndReadFile(t *testing.T, path string) string {
 	t.Helper()
 
@@ -141,4 +192,8 @@ func waitAndReadFile(t *testing.T, path string) string {
 	}
 	t.Fatalf("failed to read file %s: %v", path, err)
 	return ""
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }

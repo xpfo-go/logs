@@ -1,4 +1,4 @@
-module github.com/xpfo-go/logs
+module github.com/xpfo-go/logs/v2
 
 go 1.22
 
