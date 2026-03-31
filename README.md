@@ -1,20 +1,91 @@
-## usage
+# logs
 
-```
-logs.Dubug(something)
-logs.Info(something)
-logs.Error(something)
-...
+`logs` 是一个基于 `zap + lumberjack` 的轻量日志库，支持：
+- 控制台输出
+- 普通日志与错误日志分文件
+- 日志等级过滤
+- 按文件大小/保留天数轮转
+
+## Install
+
+```bash
+go get github.com/xpfo-go/logs@latest
 ```
 
-## change default config
+## Quick Start
 
+```go
+cfg := logs.LogConfig{
+    Dir:        "./logs",
+    FileName:   "app",
+    Level:      "info",
+    MaxAge:     14,
+    MaxSize:    100,
+    MaxBackups: 10,
+    LocalTime:  true,
+    Console:    true,
+}
+
+if err := logs.Init(cfg); err != nil {
+    panic(err)
+}
+defer logs.Close()
+
+logs.Info("service started")
+logs.Errorw("request failed", "path", "/healthz", "status", 500)
 ```
-conf := logs.GetLogConf()
-conf.MaxAge = 30
-logs.InitLogSetting(conf)
+
+## Config
+
+```go
+type LogConfig struct {
+    Dir        string // 日志目录
+    FileName   string // 基础日志名，不含后缀
+    Level      string // debug/info/warn/error/dpanic/panic/fatal
+    MaxAge     int    // 保留天数
+    MaxSize    int    // 单个文件最大 MB
+    MaxBackups int    // 备份文件数
+    LocalTime  bool   // true: 本地时区
+    Console    bool   // true: 同时输出控制台
+}
+```
+
+## Output Files
+
+初始化后会创建两个文件：
+- `<Dir>/<FileName>.log`：`Level` 以上的所有日志
+- `<Dir>/<FileName>_err.log`：仅错误级别日志（`error+`）
+
+## Panic Handling
+
+`PrintPanicStack` 用于 `defer` 场景，记录 panic 与堆栈后会重新抛出 panic：
+
+```go
+defer logs.PrintPanicStack("extra context")
+```
+
+## Compatibility
+
+- 推荐 API：`Init(LogConfig) error`
+- 兼容 API：`InitLogSetting(*LogConfig) error`（内部转调 `Init`）
+- `GetLogConf()` 返回的是当前配置副本，修改返回值不会影响全局 logger
+
+## Migration to v2
+
+v2 主要变化：
+- 配置初始化改为显式校验并返回错误（非法 level 会报错）
+- 修复 `LocalTime` 配置不生效问题
+- 删除导入时自动初始化副作用，改为惰性默认初始化（首次写日志）或显式 `Init`
+- `PrintPanicStack` 记录后会重新抛出 panic（不再吞 panic）
+
+## Development
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
 ```
 
 ## License
 
-logs is released under the MIT License. For more information, see the [LICENSE](LICENSE) file.
+MIT. See [LICENSE](LICENSE).

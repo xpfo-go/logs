@@ -1,80 +1,149 @@
 package logs
 
 import (
+	"errors"
 	"fmt"
-	"github.com/davecgh/go-spew/spew"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"time"
+
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
-	"os"
-	"runtime"
-	"sync"
-	"time"
 )
 
 type LogConfig struct {
-	FileName  string // 日志文件名
-	Level     string // 日志级别 debug info warn error dpanic panic fatal
-	MaxAge    int    // 保存时间 单位天
-	LocalTime bool   // true 使用本地时间  false 使用UTC时间
+	Dir        string // 日志目录
+	FileName   string // 基础日志文件名(不含后缀)
+	Level      string // debug info warn error dpanic panic fatal
+	MaxAge     int    // 保存天数
+	MaxSize    int    // 单个日志文件最大 MB
+	MaxBackups int    // 备份数量
+	LocalTime  bool   // true:本地时间 false:UTC
+	Console    bool   // 是否输出到控制台
 }
 
 var (
-	zapDefault, _  = zap.NewProduction()
-	l              = zapDefault.Sugar()
-	logFileHook    *lumberjack.Logger
-	errLogFileHook *lumberjack.Logger
-	once           sync.Once
+	errNilConfig     = errors.New("log config is nil")
+	errEmptyFile     = errors.New("file name must not be empty")
+	errInvalidDir    = errors.New("log dir must not be empty")
+	errInvalidMaxAge = errors.New("max age must be greater than 0")
+	errInvalidLevel  = errors.New("invalid level")
 
-	// default conf
-	conf = &LogConfig{
-		FileName:  "log",
-		Level:     "debug",
-		MaxAge:    20,
-		LocalTime: true,
-	}
+	mu           sync.RWMutex
+	lazyInitOnce sync.Once
+	l            *zap.SugaredLogger
+	currentConf  LogConfig
+	logFileHook  *lumberjack.Logger
+	errFileHook  *lumberjack.Logger
 )
 
-func init() {
-	once.Do(func() {
-		InitLogSetting(conf)
-	})
+func DefaultConfig() LogConfig {
+	return LogConfig{
+		Dir:        "logs",
+		FileName:   "log",
+		Level:      "debug",
+		MaxAge:     20,
+		MaxSize:    100,
+		MaxBackups: 10,
+		LocalTime:  true,
+		Console:    true,
+	}
 }
 
-// GetLogConf 获取日志配置
-func GetLogConf() *LogConfig {
-	return conf
+func (c LogConfig) withDefaults() LogConfig {
+	d := DefaultConfig()
+	if c.Dir != "" {
+		d.Dir = c.Dir
+	}
+	if c.FileName != "" {
+		d.FileName = c.FileName
+	}
+	if c.Level != "" {
+		d.Level = c.Level
+	}
+	if c.MaxAge > 0 {
+		d.MaxAge = c.MaxAge
+	}
+	if c.MaxSize > 0 {
+		d.MaxSize = c.MaxSize
+	}
+	if c.MaxBackups > 0 {
+		d.MaxBackups = c.MaxBackups
+	}
+	d.LocalTime = c.LocalTime
+	d.Console = c.Console
+
+	return d
 }
 
-func InitLogSetting(conf *LogConfig) {
-	// 初始化的日志级别
+func (c LogConfig) validate() error {
+	if strings.TrimSpace(c.Dir) == "" {
+		return errInvalidDir
+	}
+	if strings.TrimSpace(c.FileName) == "" {
+		return errEmptyFile
+	}
+	if c.MaxAge <= 0 {
+		return errInvalidMaxAge
+	}
+
 	level := zap.NewAtomicLevelAt(zapcore.DebugLevel)
-	_ = level.UnmarshalText([]byte(conf.Level))
+	if err := level.UnmarshalText([]byte(c.Level)); err != nil {
+		return fmt.Errorf("%w: %s", errInvalidLevel, c.Level)
+	}
 
+	return nil
+}
+
+func Init(cfg LogConfig) error {
+	cfg = cfg.withDefaults()
+	if err := cfg.validate(); err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
+		return err
+	}
+
+	level := zap.NewAtomicLevelAt(zapcore.DebugLevel)
+	if err := level.UnmarshalText([]byte(cfg.Level)); err != nil {
+		return fmt.Errorf("%w: %s", errInvalidLevel, cfg.Level)
+	}
 	logLevel := level.Level()
-	// 保留20天, 分级别输出
-	logFileHook = &lumberjack.Logger{
-		Filename:  fmt.Sprintf("./logs/%s.log", conf.FileName),
-		MaxAge:    conf.MaxAge,
-		LocalTime: true,
+
+	logHook := &lumberjack.Logger{
+		Filename:   filepath.Join(cfg.Dir, fmt.Sprintf("%s.log", cfg.FileName)),
+		MaxAge:     cfg.MaxAge,
+		MaxSize:    cfg.MaxSize,
+		MaxBackups: cfg.MaxBackups,
+		LocalTime:  cfg.LocalTime,
 	}
-	errLogFileHook = &lumberjack.Logger{
-		Filename:  fmt.Sprintf("./logs/%s_err.log", conf.FileName),
-		MaxAge:    conf.MaxAge,
-		LocalTime: true,
+	errHook := &lumberjack.Logger{
+		Filename:   filepath.Join(cfg.Dir, fmt.Sprintf("%s_err.log", cfg.FileName)),
+		MaxAge:     cfg.MaxAge,
+		MaxSize:    cfg.MaxSize,
+		MaxBackups: cfg.MaxBackups,
+		LocalTime:  cfg.LocalTime,
 	}
+
 	consoleColoredEncoderConfig := zap.NewProductionEncoderConfig()
 	consoleColoredEncoderConfig.TimeKey = "time"
 	consoleColoredEncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	consoleColoredEncoderConfig.EncodeTime = func(t time.Time, encoder zapcore.PrimitiveArrayEncoder) {
 		encoder.AppendString(t.Format("2006-01-02 15:04:05.000"))
 	}
+
 	fileEncoderConfig := zap.NewProductionEncoderConfig()
 	fileEncoderConfig.TimeKey = "time"
 	fileEncoderConfig.EncodeLevel = zapcore.CapitalLevelEncoder
 	fileEncoderConfig.EncodeTime = func(t time.Time, encoder zapcore.PrimitiveArrayEncoder) {
 		encoder.AppendString(t.Format("2006-01-02 15:04:05.000"))
 	}
+
 	filePriority := zap.LevelEnablerFunc(func(lvl zapcore.Level) bool {
 		return lvl >= logLevel
 	})
@@ -84,113 +153,204 @@ func InitLogSetting(conf *LogConfig) {
 	stdoutPriority := zap.LevelEnablerFunc(func(lvl zapcore.Level) bool {
 		return lvl >= logLevel && lvl < zapcore.ErrorLevel
 	})
-	consoleEncoder := zapcore.NewConsoleEncoder(consoleColoredEncoderConfig)
+
 	fileEncoder := zapcore.NewConsoleEncoder(fileEncoderConfig)
-	cores := zapcore.NewTee(
-		zapcore.NewCore(fileEncoder, zapcore.AddSync(logFileHook), filePriority),
-		zapcore.NewCore(fileEncoder, zapcore.AddSync(errLogFileHook), errPriority),
-		zapcore.NewCore(consoleEncoder, zapcore.Lock(os.Stdout), stdoutPriority),
-		zapcore.NewCore(consoleEncoder, zapcore.Lock(os.Stderr), errPriority),
-	)
-	// error级别输出调用栈信息
-	logger := zap.New(cores, zap.AddStacktrace(zap.NewAtomicLevelAt(zap.ErrorLevel)))
-	l = logger.Sugar()
+	consoleEncoder := zapcore.NewConsoleEncoder(consoleColoredEncoderConfig)
+
+	cores := []zapcore.Core{
+		zapcore.NewCore(fileEncoder, zapcore.AddSync(logHook), filePriority),
+		zapcore.NewCore(fileEncoder, zapcore.AddSync(errHook), errPriority),
+	}
+	if cfg.Console {
+		cores = append(cores,
+			zapcore.NewCore(consoleEncoder, zapcore.Lock(os.Stdout), stdoutPriority),
+			zapcore.NewCore(consoleEncoder, zapcore.Lock(os.Stderr), errPriority),
+		)
+	}
+
+	logger := zap.New(zapcore.NewTee(cores...), zap.AddStacktrace(zapcore.ErrorLevel)).Sugar()
+
+	mu.Lock()
+	oldLogger := l
+	oldLogFileHook := logFileHook
+	oldErrFileHook := errFileHook
+
+	l = logger
+	currentConf = cfg
+	logFileHook = logHook
+	errFileHook = errHook
+	mu.Unlock()
+
+	if oldLogger != nil {
+		_ = oldLogger.Sync()
+	}
+	if oldLogFileHook != nil {
+		_ = oldLogFileHook.Close()
+	}
+	if oldErrFileHook != nil {
+		_ = oldErrFileHook.Close()
+	}
+
+	return nil
 }
 
-// PrintPanicStack 产生panic时的调用栈打印
+// InitLogSetting 兼容旧版本 API。建议改用 Init。
+func InitLogSetting(cfg *LogConfig) error {
+	if cfg == nil {
+		return errNilConfig
+	}
+	return Init(*cfg)
+}
+
+// GetLogConf 获取当前日志配置的副本。修改返回值不会影响全局配置。
+func GetLogConf() *LogConfig {
+	cfg := CurrentConfig()
+	return &cfg
+}
+
+func CurrentConfig() LogConfig {
+	mu.RLock()
+	defer mu.RUnlock()
+
+	if l == nil {
+		return DefaultConfig()
+	}
+	return currentConf
+}
+
+func Close() error {
+	mu.Lock()
+	oldLogger := l
+	oldLogFileHook := logFileHook
+	oldErrFileHook := errFileHook
+	l = nil
+	logFileHook = nil
+	errFileHook = nil
+	currentConf = LogConfig{}
+	mu.Unlock()
+
+	if oldLogger != nil {
+		_ = oldLogger.Sync()
+	}
+	if oldLogFileHook != nil {
+		_ = oldLogFileHook.Close()
+	}
+	if oldErrFileHook != nil {
+		_ = oldErrFileHook.Close()
+	}
+	return nil
+}
+
+// PrintPanicStack 在 defer 中调用，用于记录 panic 与堆栈后继续抛出 panic。
 func PrintPanicStack(extras ...interface{}) {
 	if x := recover(); x != nil {
-		Error(x)
-		i := 0
-		funcName, file, line, ok := runtime.Caller(i)
-		for ok {
-			Errorf("frame %v:[func:%v,file:%v,line:%v]\n", i, runtime.FuncForPC(funcName).Name(), file, line)
-			i++
-			funcName, file, line, ok = runtime.Caller(i)
+		logger := getLogger()
+		logger.Errorw("panic recovered", "panic", x, "stack", string(debug.Stack()))
+		for i := range extras {
+			logger.Errorf("EXTRAS#%d DATA:%+v", i, extras[i])
 		}
-
-		for k := range extras {
-			Errorf("EXTRAS#%v DATA:%v\n", k, spew.Sdump(extras[k]))
-		}
+		panic(x)
 	}
 }
 
+func getLogger() *zap.SugaredLogger {
+	mu.RLock()
+	logger := l
+	mu.RUnlock()
+	if logger != nil {
+		return logger
+	}
+
+	lazyInitOnce.Do(func() {
+		_ = Init(DefaultConfig())
+	})
+
+	mu.RLock()
+	logger = l
+	mu.RUnlock()
+	if logger != nil {
+		return logger
+	}
+
+	return zap.NewNop().Sugar()
+}
+
 func Debug(v ...interface{}) {
-	l.Debug(v...)
+	getLogger().Debug(v...)
 }
 
 func Debugf(format string, v ...interface{}) {
-	l.Debugf(format, v...)
+	getLogger().Debugf(format, v...)
 }
 
-func Debugw(format string, keysAndValues ...interface{}) {
-	l.Debugw(format, keysAndValues...)
+func Debugw(msg string, keysAndValues ...interface{}) {
+	getLogger().Debugw(msg, keysAndValues...)
 }
 
 func Info(v ...interface{}) {
-	l.Info(v...)
+	getLogger().Info(v...)
 }
 
 func Infof(format string, v ...interface{}) {
-	l.Infof(format, v...)
+	getLogger().Infof(format, v...)
 }
 
-func Infow(format string, keysAndValues ...interface{}) {
-	l.Infow(format, keysAndValues...)
+func Infow(msg string, keysAndValues ...interface{}) {
+	getLogger().Infow(msg, keysAndValues...)
 }
 
 func Warn(v ...interface{}) {
-	l.Warn(v...)
+	getLogger().Warn(v...)
 }
 
 func Warnf(format string, v ...interface{}) {
-	l.Warnf(format, v...)
+	getLogger().Warnf(format, v...)
 }
 
-func Warnw(format string, keysAndValues ...interface{}) {
-	l.Warnw(format, keysAndValues...)
+func Warnw(msg string, keysAndValues ...interface{}) {
+	getLogger().Warnw(msg, keysAndValues...)
 }
 
 func Error(v ...interface{}) {
-	l.Error(v...)
+	getLogger().Error(v...)
 }
 
 func Errorf(format string, v ...interface{}) {
-	l.Errorf(format, v...)
+	getLogger().Errorf(format, v...)
 }
 
-func Errorw(format string, keysAndValues ...interface{}) {
-	l.Errorw(format, keysAndValues...)
+func Errorw(msg string, keysAndValues ...interface{}) {
+	getLogger().Errorw(msg, keysAndValues...)
 }
 
 func Fatal(v ...interface{}) {
-	l.Fatal(v...)
+	getLogger().Fatal(v...)
 }
 
 func Fatalf(format string, v ...interface{}) {
-	l.Fatalf(format, v...)
+	getLogger().Fatalf(format, v...)
 }
 
-func Fatalw(format string, keysAndValues ...interface{}) {
-	l.Fatalw(format, keysAndValues...)
+func Fatalw(msg string, keysAndValues ...interface{}) {
+	getLogger().Fatalw(msg, keysAndValues...)
 }
 
 func Panic(v ...interface{}) {
-	l.Panic(v...)
+	getLogger().Panic(v...)
 }
 
 func Panicf(format string, v ...interface{}) {
-	l.Panicf(format, v...)
+	getLogger().Panicf(format, v...)
 }
 
-func Panicw(format string, keysAndValues ...interface{}) {
-	l.Panicw(format, keysAndValues...)
+func Panicw(msg string, keysAndValues ...interface{}) {
+	getLogger().Panicw(msg, keysAndValues...)
 }
 
 func Sync() error {
-	return l.Sync()
+	return getLogger().Sync()
 }
 
 func With(args ...interface{}) *zap.SugaredLogger {
-	return l.With(args)
+	return getLogger().With(args...)
 }
