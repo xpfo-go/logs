@@ -8,6 +8,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -29,6 +30,14 @@ type LogConfig struct {
 	EnableConsole  *bool // nil:使用默认值(true), false:关闭控制台, true:开启控制台
 	EnableFile     *bool // nil:使用默认值(true), false:关闭文件输出, true:开启文件输出
 	SplitErrorFile *bool // nil:使用默认值(true), false:不拆分错误文件, true:拆分错误文件
+	EnableAsync    *bool // nil:默认(false), true:启用异步文件缓冲写
+
+	BufferSizeKB    int // 异步缓冲区大小(KB)
+	FlushIntervalMs int // 异步刷盘间隔(ms)
+
+	SamplingInitial    int // 采样窗口内前 N 条全量
+	SamplingThereafter int // 超过后每 M 条保留 1 条
+	SamplingTickMs     int // 采样窗口时长(ms)
 }
 
 var (
@@ -38,24 +47,32 @@ var (
 	errInvalidMaxAge = errors.New("max age must be greater than 0")
 	errInvalidLevel  = errors.New("invalid level")
 	errNoOutput      = errors.New("at least one output must be enabled")
+	errInvalidBuffer = errors.New("buffer size must be greater than 0")
+	errInvalidFlush  = errors.New("flush interval must be greater than 0")
 
 	mu          sync.RWMutex
-	l           *zap.SugaredLogger
+	initMu      sync.Mutex
+	loggerRef   atomic.Pointer[zap.SugaredLogger]
 	currentConf LogConfig
 	logFileHook *lumberjack.Logger
 	errFileHook *lumberjack.Logger
+	logBuffered *zapcore.BufferedWriteSyncer
+	errBuffered *zapcore.BufferedWriteSyncer
 )
 
 func DefaultConfig() LogConfig {
 	return LogConfig{
-		Dir:        "logs",
-		FileName:   "log",
-		Level:      "debug",
-		MaxAge:     20,
-		MaxSize:    100,
-		MaxBackups: 10,
-		LocalTime:  true,
-		Console:    true,
+		Dir:             "logs",
+		FileName:        "log",
+		Level:           "debug",
+		MaxAge:          20,
+		MaxSize:         100,
+		MaxBackups:      10,
+		LocalTime:       true,
+		Console:         true,
+		BufferSizeKB:    256,
+		FlushIntervalMs: 1000,
+		SamplingTickMs:  1000,
 	}
 }
 
@@ -97,6 +114,24 @@ func (c LogConfig) withDefaults() LogConfig {
 	if c.SplitErrorFile != nil {
 		d.SplitErrorFile = boolPtr(*c.SplitErrorFile)
 	}
+	if c.EnableAsync != nil {
+		d.EnableAsync = boolPtr(*c.EnableAsync)
+	}
+	if c.BufferSizeKB > 0 {
+		d.BufferSizeKB = c.BufferSizeKB
+	}
+	if c.FlushIntervalMs > 0 {
+		d.FlushIntervalMs = c.FlushIntervalMs
+	}
+	if c.SamplingInitial > 0 {
+		d.SamplingInitial = c.SamplingInitial
+	}
+	if c.SamplingThereafter > 0 {
+		d.SamplingThereafter = c.SamplingThereafter
+	}
+	if c.SamplingTickMs > 0 {
+		d.SamplingTickMs = c.SamplingTickMs
+	}
 
 	return d
 }
@@ -110,6 +145,12 @@ func (c LogConfig) validate() error {
 	}
 	if c.MaxAge <= 0 {
 		return errInvalidMaxAge
+	}
+	if c.BufferSizeKB <= 0 {
+		return errInvalidBuffer
+	}
+	if c.FlushIntervalMs <= 0 || c.SamplingTickMs <= 0 {
+		return errInvalidFlush
 	}
 
 	level := zap.NewAtomicLevelAt(zapcore.DebugLevel)
@@ -143,12 +184,21 @@ func Init(cfg LogConfig) error {
 	if !enableFile && !cfg.Console {
 		return errNoOutput
 	}
+	enableAsync := false
+	if cfg.EnableAsync != nil {
+		enableAsync = *cfg.EnableAsync
+	}
 
 	cfg.EnableFile = boolPtr(enableFile)
 	cfg.SplitErrorFile = boolPtr(splitErrorFile)
+	cfg.EnableAsync = boolPtr(enableAsync)
 
 	var logHook *lumberjack.Logger
 	var errHook *lumberjack.Logger
+	var logBuffer *zapcore.BufferedWriteSyncer
+	var errBuffer *zapcore.BufferedWriteSyncer
+	var logSink zapcore.WriteSyncer
+	var errSink zapcore.WriteSyncer
 	if enableFile {
 		if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
 			return err
@@ -167,6 +217,27 @@ func Init(cfg LogConfig) error {
 				MaxSize:    cfg.MaxSize,
 				MaxBackups: cfg.MaxBackups,
 				LocalTime:  cfg.LocalTime,
+			}
+		}
+
+		logSink = zapcore.AddSync(logHook)
+		if enableAsync {
+			logBuffer = &zapcore.BufferedWriteSyncer{
+				WS:            logSink,
+				Size:          cfg.BufferSizeKB * 1024,
+				FlushInterval: time.Duration(cfg.FlushIntervalMs) * time.Millisecond,
+			}
+			logSink = logBuffer
+		}
+		if splitErrorFile && errHook != nil {
+			errSink = zapcore.AddSync(errHook)
+			if enableAsync {
+				errBuffer = &zapcore.BufferedWriteSyncer{
+					WS:            errSink,
+					Size:          cfg.BufferSizeKB * 1024,
+					FlushInterval: time.Duration(cfg.FlushIntervalMs) * time.Millisecond,
+				}
+				errSink = errBuffer
 			}
 		}
 	}
@@ -200,33 +271,43 @@ func Init(cfg LogConfig) error {
 
 	cores := make([]zapcore.Core, 0, 4)
 	if enableFile {
-		cores = append(cores, zapcore.NewCore(fileEncoder, zapcore.AddSync(logHook), filePriority))
+		cores = append(cores, newCoreWithSampling(fileEncoder, logSink, filePriority, cfg))
 		if splitErrorFile && errHook != nil {
-			cores = append(cores, zapcore.NewCore(fileEncoder, zapcore.AddSync(errHook), errPriority))
+			cores = append(cores, newCoreWithSampling(fileEncoder, errSink, errPriority, cfg))
 		}
 	}
 	if cfg.Console {
 		cores = append(cores,
-			zapcore.NewCore(consoleEncoder, zapcore.Lock(os.Stdout), stdoutPriority),
-			zapcore.NewCore(consoleEncoder, zapcore.Lock(os.Stderr), errPriority),
+			newCoreWithSampling(consoleEncoder, zapcore.Lock(os.Stdout), stdoutPriority, cfg),
+			newCoreWithSampling(consoleEncoder, zapcore.Lock(os.Stderr), errPriority, cfg),
 		)
 	}
 
 	logger := zap.New(zapcore.NewTee(cores...), zap.AddStacktrace(zapcore.ErrorLevel)).Sugar()
 
 	mu.Lock()
-	oldLogger := l
+	oldLogger := loggerRef.Load()
 	oldLogFileHook := logFileHook
 	oldErrFileHook := errFileHook
+	oldLogBuffered := logBuffered
+	oldErrBuffered := errBuffered
 
-	l = logger
+	loggerRef.Store(logger)
 	currentConf = cfg
 	logFileHook = logHook
 	errFileHook = errHook
+	logBuffered = logBuffer
+	errBuffered = errBuffer
 	mu.Unlock()
 
 	if oldLogger != nil {
 		_ = oldLogger.Sync()
+	}
+	if oldLogBuffered != nil {
+		_ = oldLogBuffered.Stop()
+	}
+	if oldErrBuffered != nil {
+		_ = oldErrBuffered.Stop()
 	}
 	if oldLogFileHook != nil {
 		_ = oldLogFileHook.Close()
@@ -256,7 +337,7 @@ func CurrentConfig() LogConfig {
 	mu.RLock()
 	defer mu.RUnlock()
 
-	if l == nil {
+	if loggerRef.Load() == nil {
 		return DefaultConfig()
 	}
 	return currentConf
@@ -264,17 +345,27 @@ func CurrentConfig() LogConfig {
 
 func Close() error {
 	mu.Lock()
-	oldLogger := l
+	oldLogger := loggerRef.Load()
 	oldLogFileHook := logFileHook
 	oldErrFileHook := errFileHook
-	l = nil
+	oldLogBuffered := logBuffered
+	oldErrBuffered := errBuffered
+	loggerRef.Store(nil)
 	logFileHook = nil
 	errFileHook = nil
+	logBuffered = nil
+	errBuffered = nil
 	currentConf = LogConfig{}
 	mu.Unlock()
 
 	if oldLogger != nil {
 		_ = oldLogger.Sync()
+	}
+	if oldLogBuffered != nil {
+		_ = oldLogBuffered.Stop()
+	}
+	if oldErrBuffered != nil {
+		_ = oldErrBuffered.Stop()
 	}
 	if oldLogFileHook != nil {
 		_ = oldLogFileHook.Close()
@@ -298,18 +389,21 @@ func PrintPanicStack(extras ...interface{}) {
 }
 
 func getLogger() *zap.SugaredLogger {
-	mu.RLock()
-	logger := l
-	mu.RUnlock()
+	logger := loggerRef.Load()
+	if logger != nil {
+		return logger
+	}
+
+	initMu.Lock()
+	defer initMu.Unlock()
+	logger = loggerRef.Load()
 	if logger != nil {
 		return logger
 	}
 
 	_ = Init(DefaultConfig())
 
-	mu.RLock()
-	logger = l
-	mu.RUnlock()
+	logger = loggerRef.Load()
 	if logger != nil {
 		return logger
 	}
@@ -399,4 +493,13 @@ func With(args ...interface{}) *zap.SugaredLogger {
 
 func boolPtr(v bool) *bool {
 	return &v
+}
+
+func newCoreWithSampling(encoder zapcore.Encoder, ws zapcore.WriteSyncer, enabler zapcore.LevelEnabler, cfg LogConfig) zapcore.Core {
+	core := zapcore.NewCore(encoder, ws, enabler)
+	if cfg.SamplingInitial > 0 && cfg.SamplingThereafter > 0 {
+		tick := time.Duration(cfg.SamplingTickMs) * time.Millisecond
+		core = zapcore.NewSamplerWithOptions(core, tick, cfg.SamplingInitial, cfg.SamplingThereafter)
+	}
+	return core
 }

@@ -4,7 +4,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -284,6 +286,105 @@ func TestGetLogger_ReInitAfterClose(t *testing.T) {
 	}
 }
 
+func TestInit_SamplingReducesRepeatedLogs(t *testing.T) {
+	dir := t.TempDir()
+	if err := Init(LogConfig{
+		Dir:                dir,
+		FileName:           "sampled",
+		Level:              "info",
+		MaxAge:             1,
+		EnableConsole:      boolPtr(false),
+		EnableFile:         boolPtr(true),
+		SplitErrorFile:     boolPtr(false),
+		SamplingInitial:    1,
+		SamplingThereafter: 1000,
+		SamplingTickMs:     1000,
+	}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = Close()
+	})
+
+	for i := 0; i < 100; i++ {
+		Info("sampled-message")
+	}
+	_ = Sync()
+
+	logData := waitAndReadFile(t, filepath.Join(dir, "sampled.log"))
+	lines := countNonEmptyLines(logData)
+	if lines >= 20 {
+		t.Fatalf("expected sampling to reduce lines, got %d lines", lines)
+	}
+}
+
+func TestInit_AsyncWriteEnabled(t *testing.T) {
+	dir := t.TempDir()
+	if err := Init(LogConfig{
+		Dir:             dir,
+		FileName:        "async",
+		Level:           "info",
+		MaxAge:          1,
+		EnableConsole:   boolPtr(false),
+		EnableFile:      boolPtr(true),
+		EnableAsync:     boolPtr(true),
+		BufferSizeKB:    64,
+		FlushIntervalMs: 50,
+	}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = Close()
+	})
+
+	Info("async-message")
+	_ = Sync()
+	logData := waitAndReadFile(t, filepath.Join(dir, "async.log"))
+	if !strings.Contains(logData, "async-message") {
+		t.Fatalf("expected async log message in file")
+	}
+}
+
+func TestConcurrentInitAndLogging(t *testing.T) {
+	dir := t.TempDir()
+	if err := Init(LogConfig{
+		Dir:           dir,
+		FileName:      "concurrent",
+		Level:         "debug",
+		MaxAge:        1,
+		EnableConsole: boolPtr(false),
+		EnableFile:    boolPtr(true),
+	}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = Close()
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				Info("concurrent-log", "g", id, "n", j)
+				if j%50 == 0 {
+					_ = Init(LogConfig{
+						Dir:           dir,
+						FileName:      "concurrent_" + strconv.Itoa(id),
+						Level:         "debug",
+						MaxAge:        1,
+						EnableConsole: boolPtr(false),
+						EnableFile:    boolPtr(true),
+					})
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	_ = Sync()
+}
+
 func waitAndReadFile(t *testing.T, path string) string {
 	t.Helper()
 
@@ -298,4 +399,15 @@ func waitAndReadFile(t *testing.T, path string) string {
 	}
 	t.Fatalf("failed to read file %s: %v", path, err)
 	return ""
+}
+
+func countNonEmptyLines(s string) int {
+	lines := strings.Split(s, "\n")
+	count := 0
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+	return count
 }

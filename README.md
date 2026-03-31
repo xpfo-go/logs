@@ -33,6 +33,13 @@ cfg := logs.LogConfig{
     EnableConsole:  &enableConsole,
     EnableFile:     &enableFile,
     SplitErrorFile: &splitErrFile,
+    // 可选并发优化
+    // EnableAsync:     boolPtr(true),
+    // BufferSizeKB:    512,
+    // FlushIntervalMs: 100,
+    // SamplingInitial: 100,
+    // SamplingThereafter: 1000,
+    // SamplingTickMs: 1000,
 }
 
 if err := logs.Init(cfg); err != nil {
@@ -61,7 +68,32 @@ type LogConfig struct {
     EnableConsole  *bool // nil:默认(true), false:关闭控制台
     EnableFile     *bool // nil:默认(true), false:关闭文件输出
     SplitErrorFile *bool // nil:默认(true), false:不拆分错误文件
+    EnableAsync    *bool // nil:默认(false), true:启用异步文件缓冲写
+
+    BufferSizeKB    int // 异步缓冲区大小(KB)
+    FlushIntervalMs int // 异步刷盘间隔(ms)
+
+    SamplingInitial    int // 采样窗口内前 N 条全量
+    SamplingThereafter int // 超过后每 M 条保留 1 条
+    SamplingTickMs     int // 采样窗口时长(ms)
 }
+```
+
+## High Concurrency Tips
+
+高并发场景建议：
+- 开启异步文件写：`EnableAsync=true`
+- 适当增大缓冲区：`BufferSizeKB=256~1024`
+- 缩短刷盘间隔：`FlushIntervalMs=50~200`
+- 对高频重复日志开启采样：
+  - `SamplingInitial=100`
+  - `SamplingThereafter=1000`
+  - `SamplingTickMs=1000`
+
+基准测试：
+
+```bash
+go test -bench . -benchmem
 ```
 
 ## Output Files
