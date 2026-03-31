@@ -17,15 +17,22 @@ go get github.com/xpfo-go/logs/v2@latest
 ```go
 import "github.com/xpfo-go/logs/v2"
 
+useLocalTime := true
+enableConsole := true
+enableFile := true
+splitErrFile := true
+
 cfg := logs.LogConfig{
-    Dir:        "./logs",
-    FileName:   "app",
-    Level:      "info",
-    MaxAge:     14,
-    MaxSize:    100,
-    MaxBackups: 10,
-    LocalTime:  true,
-    Console:    true,
+    Dir:            "./logs",
+    FileName:       "app",
+    Level:          "info",
+    MaxAge:         14,
+    MaxSize:        100,
+    MaxBackups:     10,
+    UseLocalTime:   &useLocalTime,
+    EnableConsole:  &enableConsole,
+    EnableFile:     &enableFile,
+    SplitErrorFile: &splitErrFile,
 }
 
 if err := logs.Init(cfg); err != nil {
@@ -50,8 +57,10 @@ type LogConfig struct {
     LocalTime  bool   // Deprecated，建议使用 UseLocalTime
     Console    bool   // Deprecated，建议使用 EnableConsole
 
-    UseLocalTime  *bool // nil:默认(true), false:UTC
-    EnableConsole *bool // nil:默认(true), false:关闭控制台
+    UseLocalTime   *bool // nil:默认(true), false:UTC
+    EnableConsole  *bool // nil:默认(true), false:关闭控制台
+    EnableFile     *bool // nil:默认(true), false:关闭文件输出
+    SplitErrorFile *bool // nil:默认(true), false:不拆分错误文件
 }
 ```
 
@@ -81,6 +90,7 @@ v2 主要变化：
 - 模块路径改为 `github.com/xpfo-go/logs/v2`
 - 配置初始化改为显式校验并返回错误（非法 level 会报错）
 - 修复 `LocalTime` 配置不生效问题
+- 增加输出控制：`EnableFile` / `EnableConsole` / `SplitErrorFile`
 - 删除导入时自动初始化副作用，改为惰性默认初始化（首次写日志）或显式 `Init`
 - `PrintPanicStack` 记录后会重新抛出 panic（不再吞 panic）
 - 文件日志输出改为 JSON 编码（更适合日志采集系统）

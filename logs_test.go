@@ -178,6 +178,112 @@ func TestInit_ExplicitBoolOverrides(t *testing.T) {
 	}
 }
 
+func TestInit_NoOutputConfigured(t *testing.T) {
+	if err := Init(LogConfig{
+		Dir:           t.TempDir(),
+		FileName:      "app",
+		Level:         "info",
+		MaxAge:        1,
+		EnableFile:    boolPtr(false),
+		EnableConsole: boolPtr(false),
+	}); !errors.Is(err, errNoOutput) {
+		t.Fatalf("expected errNoOutput, got %v", err)
+	}
+}
+
+func TestInit_ConsoleOnly_NoLogFilesCreated(t *testing.T) {
+	dir := t.TempDir()
+	if err := Init(LogConfig{
+		Dir:           dir,
+		FileName:      "app",
+		Level:         "info",
+		MaxAge:        1,
+		EnableFile:    boolPtr(false),
+		EnableConsole: boolPtr(true),
+	}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = Close()
+	})
+
+	Info("console-only")
+	_ = Sync()
+
+	if _, err := os.Stat(filepath.Join(dir, "app.log")); !os.IsNotExist(err) {
+		t.Fatalf("expected no app.log when file output disabled")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "app_err.log")); !os.IsNotExist(err) {
+		t.Fatalf("expected no app_err.log when file output disabled")
+	}
+}
+
+func TestInit_NoErrorSplit_NoErrFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := Init(LogConfig{
+		Dir:            dir,
+		FileName:       "app",
+		Level:          "info",
+		MaxAge:         1,
+		EnableFile:     boolPtr(true),
+		SplitErrorFile: boolPtr(false),
+		EnableConsole:  boolPtr(false),
+	}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = Close()
+	})
+
+	Error("no-split-error")
+	_ = Sync()
+
+	logData := waitAndReadFile(t, filepath.Join(dir, "app.log"))
+	if !strings.Contains(logData, "no-split-error") {
+		t.Fatalf("error should still be written into main log when split disabled")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "app_err.log")); !os.IsNotExist(err) {
+		t.Fatalf("expected no app_err.log when split error file disabled")
+	}
+}
+
+func TestGetLogger_ReInitAfterClose(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd failed: %v", err)
+	}
+	tempWd := t.TempDir()
+	if err := os.Chdir(tempWd); err != nil {
+		t.Fatalf("chdir temp failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(wd)
+	})
+
+	dir := t.TempDir()
+	if err := Init(LogConfig{
+		Dir:           dir,
+		FileName:      "app",
+		Level:         "info",
+		MaxAge:        1,
+		EnableConsole: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	if err := Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	Info("after-close-should-reinit")
+	cfg := CurrentConfig()
+	if cfg.FileName != "log" {
+		t.Fatalf("expected lazy default re-init after close, got %+v", cfg)
+	}
+	if err := Close(); err != nil {
+		t.Fatalf("second close failed: %v", err)
+	}
+}
+
 func waitAndReadFile(t *testing.T, path string) string {
 	t.Helper()
 
@@ -192,8 +298,4 @@ func waitAndReadFile(t *testing.T, path string) string {
 	}
 	t.Fatalf("failed to read file %s: %v", path, err)
 	return ""
-}
-
-func boolPtr(v bool) *bool {
-	return &v
 }

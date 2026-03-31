@@ -25,8 +25,10 @@ type LogConfig struct {
 	LocalTime  bool   // Deprecated: 仅兼容 v1/v2.0.0，建议使用 UseLocalTime
 	Console    bool   // Deprecated: 仅兼容 v1/v2.0.0，建议使用 EnableConsole
 
-	UseLocalTime  *bool // nil:使用默认值(true), false:UTC, true:本地时间
-	EnableConsole *bool // nil:使用默认值(true), false:关闭控制台, true:开启控制台
+	UseLocalTime   *bool // nil:使用默认值(true), false:UTC, true:本地时间
+	EnableConsole  *bool // nil:使用默认值(true), false:关闭控制台, true:开启控制台
+	EnableFile     *bool // nil:使用默认值(true), false:关闭文件输出, true:开启文件输出
+	SplitErrorFile *bool // nil:使用默认值(true), false:不拆分错误文件, true:拆分错误文件
 }
 
 var (
@@ -35,13 +37,13 @@ var (
 	errInvalidDir    = errors.New("log dir must not be empty")
 	errInvalidMaxAge = errors.New("max age must be greater than 0")
 	errInvalidLevel  = errors.New("invalid level")
+	errNoOutput      = errors.New("at least one output must be enabled")
 
-	mu           sync.RWMutex
-	lazyInitOnce sync.Once
-	l            *zap.SugaredLogger
-	currentConf  LogConfig
-	logFileHook  *lumberjack.Logger
-	errFileHook  *lumberjack.Logger
+	mu          sync.RWMutex
+	l           *zap.SugaredLogger
+	currentConf LogConfig
+	logFileHook *lumberjack.Logger
+	errFileHook *lumberjack.Logger
 )
 
 func DefaultConfig() LogConfig {
@@ -89,6 +91,12 @@ func (c LogConfig) withDefaults() LogConfig {
 		// 兼容旧代码显式设置 Console=true 的场景。
 		d.Console = true
 	}
+	if c.EnableFile != nil {
+		d.EnableFile = boolPtr(*c.EnableFile)
+	}
+	if c.SplitErrorFile != nil {
+		d.SplitErrorFile = boolPtr(*c.SplitErrorFile)
+	}
 
 	return d
 }
@@ -118,29 +126,49 @@ func Init(cfg LogConfig) error {
 		return err
 	}
 
-	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
-		return err
-	}
-
 	level := zap.NewAtomicLevelAt(zapcore.DebugLevel)
 	if err := level.UnmarshalText([]byte(cfg.Level)); err != nil {
 		return fmt.Errorf("%w: %s", errInvalidLevel, cfg.Level)
 	}
 	logLevel := level.Level()
 
-	logHook := &lumberjack.Logger{
-		Filename:   filepath.Join(cfg.Dir, fmt.Sprintf("%s.log", cfg.FileName)),
-		MaxAge:     cfg.MaxAge,
-		MaxSize:    cfg.MaxSize,
-		MaxBackups: cfg.MaxBackups,
-		LocalTime:  cfg.LocalTime,
+	enableFile := true
+	if cfg.EnableFile != nil {
+		enableFile = *cfg.EnableFile
 	}
-	errHook := &lumberjack.Logger{
-		Filename:   filepath.Join(cfg.Dir, fmt.Sprintf("%s_err.log", cfg.FileName)),
-		MaxAge:     cfg.MaxAge,
-		MaxSize:    cfg.MaxSize,
-		MaxBackups: cfg.MaxBackups,
-		LocalTime:  cfg.LocalTime,
+	splitErrorFile := true
+	if cfg.SplitErrorFile != nil {
+		splitErrorFile = *cfg.SplitErrorFile
+	}
+	if !enableFile && !cfg.Console {
+		return errNoOutput
+	}
+
+	cfg.EnableFile = boolPtr(enableFile)
+	cfg.SplitErrorFile = boolPtr(splitErrorFile)
+
+	var logHook *lumberjack.Logger
+	var errHook *lumberjack.Logger
+	if enableFile {
+		if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
+			return err
+		}
+		logHook = &lumberjack.Logger{
+			Filename:   filepath.Join(cfg.Dir, fmt.Sprintf("%s.log", cfg.FileName)),
+			MaxAge:     cfg.MaxAge,
+			MaxSize:    cfg.MaxSize,
+			MaxBackups: cfg.MaxBackups,
+			LocalTime:  cfg.LocalTime,
+		}
+		if splitErrorFile {
+			errHook = &lumberjack.Logger{
+				Filename:   filepath.Join(cfg.Dir, fmt.Sprintf("%s_err.log", cfg.FileName)),
+				MaxAge:     cfg.MaxAge,
+				MaxSize:    cfg.MaxSize,
+				MaxBackups: cfg.MaxBackups,
+				LocalTime:  cfg.LocalTime,
+			}
+		}
 	}
 
 	consoleColoredEncoderConfig := zap.NewProductionEncoderConfig()
@@ -170,9 +198,12 @@ func Init(cfg LogConfig) error {
 	fileEncoder := zapcore.NewJSONEncoder(fileEncoderConfig)
 	consoleEncoder := zapcore.NewConsoleEncoder(consoleColoredEncoderConfig)
 
-	cores := []zapcore.Core{
-		zapcore.NewCore(fileEncoder, zapcore.AddSync(logHook), filePriority),
-		zapcore.NewCore(fileEncoder, zapcore.AddSync(errHook), errPriority),
+	cores := make([]zapcore.Core, 0, 4)
+	if enableFile {
+		cores = append(cores, zapcore.NewCore(fileEncoder, zapcore.AddSync(logHook), filePriority))
+		if splitErrorFile && errHook != nil {
+			cores = append(cores, zapcore.NewCore(fileEncoder, zapcore.AddSync(errHook), errPriority))
+		}
 	}
 	if cfg.Console {
 		cores = append(cores,
@@ -274,9 +305,7 @@ func getLogger() *zap.SugaredLogger {
 		return logger
 	}
 
-	lazyInitOnce.Do(func() {
-		_ = Init(DefaultConfig())
-	})
+	_ = Init(DefaultConfig())
 
 	mu.RLock()
 	logger = l
@@ -366,4 +395,8 @@ func Sync() error {
 
 func With(args ...interface{}) *zap.SugaredLogger {
 	return getLogger().With(args...)
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }
